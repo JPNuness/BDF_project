@@ -6,20 +6,23 @@ locally with DuckDB and Parquet, then in the cloud with Amazon S3, AWS Glue and 
 ## Architecture
 
 ```
-                LOCAL                                          CLOUD (AWS, us-east-1)
- ┌──────────────────────────────────────┐        ┌──────────────────────────────────────────────┐
- │ data/  raw CSV / TSV                 │ upload │ s3://bdf-movies-data-g23/data/     raw       │
- │   │  DuckDB COPY (notebook)          │ ─────▶ │ s3://bdf-movies-data-g23/parquet/  Parquet   │
- │   ▼                                  │        │        │                                     │
- │ src/parquet/  Parquet                │        │        ▼                                     │
- │   │                                  │        │ Glue Data Catalog, database bdf_project      │
- │   ▼                                  │        │   Parquet tables: Glue crawler               │
- │ src/popularity_vs_quality.duckdb     │        │   raw_* tables:   Athena DDL                 │
- │   │                                  │        │        │                                     │
- │   ▼                                  │        │        ▼                                     │
- │ notebook: SQL + Polars + Plotly      │        │ Athena (SQL), results in                     │
- └──────────────────────────────────────┘        │ s3://bdf-athena-results-g23/                 │
-                                                 └──────────────────────────────────────────────┘
+              LOCAL (laptop)                                CLOUD (AWS, us-east-1)
+ ┌────────────────────────────────────────┐        ┌──────────────────────────────────────────────┐
+ │ data/<dataset>/, data/imdb/  CSV / TSV │ upload │ s3://bdf-movies-data-g23/data/     CSV / TSV │
+ │   │  DuckDB COPY (notebook)            │ ─────▶ │ s3://bdf-movies-data-g23/parquet/  Parquet   │
+ │   ▼                                    │        │        │                                     │
+ │ src/parquet/<dataset>/, imdb/  Parquet │        │        ▼                                     │
+ │   │                                    │        │ Glue Data Catalog                            │
+ │   ▼                                    │        │   bdf_project (100k), bdf_project_32m (32M)  │
+ │ src/popularity_vs_quality_<dataset>    │        │   Parquet tables: Glue crawler               │
+ │     .duckdb                            │        │   raw_* (CSV) tables: SQL                    │
+ │   │                                    │        │        │                                     │
+ │   ▼                                    │        │        ▼                                     │
+ │ notebook: SQL + Polars + Plotly        │        │ Athena (SQL), results in                     │
+ └────────────────────────────────────────┘        │ s3://bdf-athena-results-g23/                 │
+                                                   └──────────────────────────────────────────────┘
+
+<dataset> = ml-100k (default) or ml-32m
 ```
 
 ## Project structure
@@ -32,7 +35,7 @@ cloud/benchmark_results_*.csv     latest benchmark output, one file per dataset
 requirements.txt                  pinned dependencies
 ```
 
-Generated and git-ignored: `data/`, `src/parquet/`, `*.duckdb`, `s3_upload/`.
+Not in git (downloaded or generated): `data/`, `src/parquet/`, `*.duckdb`, `s3_upload/`, `.venv/`.
 
 ## Setup
 
@@ -140,7 +143,8 @@ The script can be re-run safely; it reuses anything that already exists. It:
            └── imdb_ratings/imdb_ratings.parquet
    ```
 
-   The same layout is mirrored locally in `s3_upload/` (git-ignored).
+   Before uploading, the script copies the files into this layout in `s3_upload/`
+   (not in git; it can be deleted and is rebuilt on the next run).
 
 3. creates the Glue database and crawler (role `LabRole`) over the five Parquet folders
    and runs it: `bdf_project` / `bdf-parquet-crawler` for ml-100k,
@@ -148,15 +152,15 @@ The script can be re-run safely; it reuses anything that already exists. It:
    databases and point to the same `parquet/imdb/` files;
 4. counts the rows of each table in Athena and compares them with the local Parquet files.
 
-Result: **all five tables match** the local DuckDB counts.
+Result: **all five tables match** the local DuckDB counts, for both datasets.
 
-| Table          | Athena    | DuckDB    |
-| -------------- | --------- | --------- |
-| movies         | 9,742     | 9,742     |
-| ratings        | 100,836   | 100,836   |
-| links          | 9,742     | 9,742     |
-| imdb_basics    | 761,268   | 761,268   |
-| imdb_ratings   | 1,733,543 | 1,733,543 |
+| Table          | ml-100k   | ml-32m     |
+| -------------- | --------- | ---------- |
+| movies         | 9,742     | 87,585     |
+| ratings        | 100,836   | 32,000,204 |
+| links          | 9,742     | 87,585     |
+| imdb_basics    | 761,268   | 761,268    |
+| imdb_ratings   | 1,733,543 | 1,733,543  |
 
 The count query scanned **0 bytes**: Parquet stores row counts in the file footer,
 so Athena answers `COUNT(*)` from metadata alone.
@@ -239,18 +243,18 @@ data. The whole notebook also still runs on 32M in about 6 seconds on the laptop
 
 ## Progress
 
-- [x] Local analysis: notebook with DuckDB, Parquet, Polars and Plotly
-- [x] Reproduced from a clean clone (all MovieLens results identical; IMDb differs
-      slightly because the dump is newer)
-- [x] S3 buckets and upload (raw + Parquet)
-- [x] Glue database and crawler for the Parquet tables
-- [x] Athena tables for the raw files (DDL)
-- [x] Athena row counts match DuckDB
-- [x] Performance evidence: CSV vs Parquet, laptop vs cloud, 100k vs 32M
-- [x] Notebook configurable by dataset (`BDF_DATASET`), Parquet rebuilt when stale
-- [x] MovieLens 32M: local run and comparison of results
-- [x] MovieLens 32M in S3 / Glue / Athena (row counts match)
-- [ ] (Optional) Test file layout for Athena: bigger blocks, several files, partitions
-- [ ] Remove the old flat Parquet folders from S3 (`parquet/movies/`, `parquet/ratings/`,
-      `parquet/links/`, `parquet/imdb_basics/`, `parquet/imdb_ratings/`)
-- [ ] Slides: architecture, evidence, performance, conclusions
+Done:
+
+- [x] Local layer: notebook with DuckDB, Parquet, Polars and Plotly, reproducible from a
+      clean clone
+- [x] Notebook works with MovieLens 100k and 32M (`BDF_DATASET`)
+- [x] Cloud layer: data in S3, tables in the Glue Data Catalog, queries in Athena, for
+      both datasets; row counts match the laptop
+- [x] Performance and scalability evidence: CSV vs Parquet, laptop vs cloud, 100k vs 32M
+
+To do:
+
+- [ ] Slides: questions, architecture, evidence, performance/scalability, conclusions
+- [ ] Delete the old Parquet folders in S3, no longer used: `parquet/movies/`,
+      `parquet/ratings/`, `parquet/links/`, `parquet/imdb_basics/`, `parquet/imdb_ratings/`
+- [ ] (Optional) Test other file layouts in Athena: bigger blocks, several files, partitions
