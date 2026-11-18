@@ -102,7 +102,7 @@ The project uses an AWS Academy Learner Lab account. Start the lab, open
 **AWS Details → AWS CLI: Show** and paste the block into `~/.aws/credentials`.
 The credentials expire when the lab session ends and have to be copied again.
 
-### 1. Upload, catalog and check: `cloud/aws_setup.py`
+### Upload, catalog and check: `cloud/aws_setup.py`
 
 ```bash
 python cloud/aws_setup.py                    # ml-100k, every step
@@ -161,118 +161,81 @@ Result: **all five tables match** the local DuckDB counts.
 The count query scanned **0 bytes**: Parquet stores row counts in the file footer,
 so Athena answers `COUNT(*)` from metadata alone.
 
-### 2. Athena tables
+Raw CSV/TSV tables (`raw_*`) are created with SQL in `cloud/benchmark.py` instead of the
+crawler, because the crawler would turn `links.imdbId` into a number and lose its leading
+zeros (`0114709` → `114709`), which breaks the link to IMDb.
 
-| Table                                                  | Over                     | Created by                     |
-| ------------------------------------------------------ | ------------------------ | ------------------------------ |
-| `movies`, `ratings`, `links`, `imdb_basics`, `imdb_ratings` | `parquet/`               | Glue crawler                   |
-| `raw_movies`, `raw_ratings`, `raw_links`, `raw_imdb_basics`, `raw_imdb_ratings` | `data/` (CSV / TSV) | `CREATE EXTERNAL TABLE` in `cloud/benchmark.py` |
-
-The raw tables are defined with DDL rather than the crawler: a crawler would read
-`links.imdbId` as a number and drop its leading zeros (`0114709` → `114709`), which breaks
-the join with IMDb (`'tt' || imdbId = tconst`). The IMDb TSVs use `\N` for NULL and no
-quoting. Note that `timestamp` is a reserved word in Athena and must be written
-`"timestamp"` in queries.
-
-### 3. Benchmark: `cloud/benchmark.py`
+## Performance and scalability evidence
 
 ```bash
-python cloud/benchmark.py                    # ml-100k
-python cloud/benchmark.py --dataset ml-32m
+python cloud/benchmark.py                    # MovieLens 100k
+python cloud/benchmark.py --dataset ml-32m   # MovieLens 32M
 ```
 
-Runs the queries from the notebook on raw CSV/TSV and on Parquet, locally (DuckDB) and
-in Athena, three times each (median time). All 12 combinations return the same result.
-Output: `cloud/benchmark_results_<dataset>.csv`. A fourth query (rating vs each
-rater's own average, a join of `ratings` with itself) was added for the 32M run.
+We asked the same questions from the notebook in four ways: on the original **CSV** files
+and on **Parquet** files, on a **laptop** (DuckDB) and in the **cloud** (Athena). All four
+always gave the same answer. Each run was repeated 3 times and the middle time is shown.
+Full numbers: `cloud/benchmark_results_ml-100k.csv` and `cloud/benchmark_results_ml-32m.csv`.
 
-| Query                                     | Engine | CSV / TSV                     | Parquet                     |
-| ----------------------------------------- | ------ | ----------------------------- | --------------------------- |
-| Rating per popularity bucket (MovieLens)  | DuckDB | 34 ms                         | 4 ms                        |
-|                                           | Athena | 840 ms · 2.48 MB scanned      | 547 ms · 0.27 MB scanned    |
-| Rating per IMDb votes level (IMDb join)   | DuckDB | 346 ms                        | 22 ms                       |
-|                                           | Athena | 1,576 ms · 1,158 MB · $0.0058 | 2,195 ms · 17 MB · $0.00009 |
-| One column of `title.basics`              | DuckDB | 287 ms                        | 3 ms                        |
-|                                           | Athena | 1,178 ms · 1,128 MB · $0.0056 | 580 ms · 0.94 MB · $0.00005 |
+### 1. Parquet files are much smaller
 
-Findings:
+| File                    | CSV     | Parquet             | Smaller by |
+| ----------------------- | ------- | ------------------- | ---------- |
+| MovieLens 32M ratings   | 877 MB  | 219 MB              | 4×         |
+| IMDb list of titles     | 1.1 GB  | 18 MB (films only)  | 60×        |
 
-- **Parquet cuts the data Athena scans by 9× to ~1,200×**: it is columnar, so only the
-  columns a query uses are read, and the IMDb Parquet files hold feature films only.
-- **Cost follows bytes scanned** ($5 per TB, minimum 10 MB per query): the IMDb join is
-  67× cheaper on Parquet. For the small MovieLens query both formats hit the 10 MB minimum.
-- **At this size, local DuckDB is faster than Athena** (3–22 ms vs 0.5–2 s). Athena has a
-  fixed overhead of about 0.5 s per query, and 30 MB of Parquet fits easily on a laptop.
-  The cloud layer pays off with larger data and shared access, which is what the
-  MovieLens 32M step will test.
+Uploading the 32M ratings to the cloud took 27 s as CSV and 6 s as Parquet.
 
-## Scale-up: MovieLens 32M
+### 2. In the cloud, Parquet reads less data, so it costs less
 
-Same notebook, `BDF_DATASET=ml-32m` (87,585 movies, 200,948 users, 32,000,204 ratings).
+Athena charges for the data it reads ($5 per TB). Parquet stores each column separately,
+so Athena reads only the columns a question needs; a CSV file has to be read in full.
 
-### 32M in the cloud
+| Question (MovieLens 32M)               | Data read: CSV | Parquet | Cost per 1,000 runs: CSV | Parquet |
+| -------------------------------------- | -------------- | ------- | ------------------------ | ------- |
+| Average rating per popularity level    | 877 MB         | 86 MB   | $4.39                    | $0.43   |
+| Rating vs the user's usual rating      | 877 MB         | 88 MB   | $4.39                    | $0.44   |
+| IMDb rating per number of votes        | 1,158 MB       | 17 MB   | $5.79                    | $0.09   |
+| Number of IMDb genres (one column)     | 1,128 MB       | 0.9 MB  | $5.64                    | $0.05   |
 
-`python cloud/aws_setup.py --dataset ml-32m` uploaded the 32M files (`ratings.csv` 877 MB in
-26.7 s, `ratings.parquet` 219 MB in 5.9 s), created database `bdf_project_32m` with crawler
-`bdf-parquet-crawler-32m`, and the Athena row counts match DuckDB for all five tables
-(32,000,204 ratings).
+Counting rows read **0 MB**: a Parquet file stores its row count, so Athena does not need
+to open the data at all.
 
-`python cloud/benchmark.py --dataset ml-32m` (median of 3 runs, all 16 combinations return the
-same result; output in `cloud/benchmark_results_ml-32m.csv`):
+### 3. On the laptop, Parquet is 6 to 100 times faster
 
-| Query                                   | Engine | CSV / TSV                     | Parquet                     |
-| --------------------------------------- | ------ | ----------------------------- | --------------------------- |
-| Rating per popularity bucket            | DuckDB | 395 ms                        | 60 ms                       |
-|                                         | Athena | 1,572 ms · 877 MB · $0.0044   | 1,830 ms · 86 MB · $0.00043 |
-| Rating vs rater's own average (join)    | DuckDB | 853 ms                        | 124 ms                      |
-|                                         | Athena | 2,418 ms · 877 MB · $0.0044   | 4,020 ms · 88 MB · $0.00044 |
-| Rating per IMDb votes level (IMDb join) | DuckDB | 357 ms                        | 23 ms                       |
-|                                         | Athena | 1,885 ms · 1,158 MB · $0.0058 | 2,122 ms · 17 MB · $0.00009 |
-| One column of `title.basics`            | DuckDB | 286 ms                        | 3 ms                        |
-|                                         | Athena | 1,377 ms · 1,128 MB · $0.0056 | 631 ms · 0.94 MB · $0.00005 |
+| Question (MovieLens 32M)               | CSV    | Parquet |
+| -------------------------------------- | ------ | ------- |
+| Average rating per popularity level    | 395 ms | 60 ms   |
+| Rating vs the user's usual rating      | 853 ms | 124 ms  |
+| IMDb rating per number of votes        | 357 ms | 23 ms   |
+| Number of IMDb genres (one column)     | 286 ms | 3 ms    |
 
-Scaling from ml-100k to ml-32m (317× more ratings), query "rating per popularity bucket":
+### 4. 317 times more data, only 3 times more time in the cloud
 
-| Metric                  | ml-100k  | ml-32m   | Growth |
-| ----------------------- | -------- | -------- | ------ |
-| Athena bytes scanned, Parquet | 0.27 MB | 86 MB | 320×   |
-| Athena bytes scanned, CSV     | 2.5 MB  | 877 MB | 353×  |
-| Athena time, Parquet    | 547 ms   | 1,830 ms | 3.3×   |
-| DuckDB time, Parquet    | 4 ms     | 60 ms    | 15×    |
+Going from MovieLens 100k to 32M (317× more ratings), question "average rating per
+popularity level", Parquet:
 
-Findings:
+|                         | 100k    | 32M      | Growth |
+| ----------------------- | ------- | -------- | ------ |
+| Data read by Athena     | 0.27 MB | 86 MB    | 320×   |
+| Time in Athena          | 0.55 s  | 1.8 s    | 3.3×   |
+| Time on the laptop      | 4 ms    | 60 ms    | 15×    |
 
-- **Bytes scanned and cost grow with the data; time does not.** Athena scans 320× more
-  but takes only 3.3× longer: the work is spread over more workers.
-- **Parquet scans 10× less of `ratings`** (86 MB of 877 MB): only `userid`, `movieid` and
-  `rating` are read, compressed, and `timestamp` is skipped. Cost is 10× lower:
-  $0.43 vs $4.39 per 1,000 queries.
-- **Athena was slower on Parquet than on CSV for the `ratings` queries** (1.8 s vs 1.6 s,
-  4.0 s vs 2.4 s). The Parquet file is a single 219 MB file with 260 small row groups
-  (~0.85 MB each, written by DuckDB's default `COPY`). AWS recommends larger blocks and
-  several files so the work can be split; this is the likely cause and is tested in the
-  next step (file layout and partitioning).
-- **32M (about 1 GB) is still single-machine scale**: local DuckDB on Parquet answers in
-  60–124 ms. The cloud layer adds shared access, no local download and pay-per-query
-  storage. Its speed advantage would show at larger sizes (e.g. MovieLens 1B).
+Athena splits the work among many machines, so its time grows much more slowly than the
+data. The whole notebook also still runs on 32M in about 6 seconds on the laptop.
 
-### Results compared with ml-100k
+### 5. Limits: where the cloud does not help (yet)
 
-| Check                                          | ml-100k        | ml-32m         |
-| ---------------------------------------------- | -------------- | -------------- |
-| Average rating, 2–4 ratings vs 100+ ratings    | 3.18 vs 3.82   | 2.92 vs 3.30   |
-| Spearman, all / ≥ 10 / ≥ 50 / ≥ 100 ratings    | 0.04 / 0.25 / 0.31 / 0.32 | 0.16 / 0.25 / 0.22 / 0.19 |
-| Spearman ≥ 50 ratings, after removing user bias | 0.28          | 0.07           |
-| Gap 2–4 vs 100+ after removing user bias       | 0.44 of 0.64   | 0.18 of 0.38   |
-| Spearman inside decades                        | 0.17 to 0.41   | 0.21 to 0.53   |
-| Spearman inside genres                         | 0.19 to 0.61   | 0.15 to 0.76   |
-| MovieLens popularity vs IMDb rating (≥ 10)     | 0.35           | 0.18           |
-| Movies in both Top 20 lists                    | 7              | 4              |
-
-The direction holds at 32M (popular movies are rated higher, inside every decade and genre
-and on IMDb), but the effect is weaker, and after removing user bias it almost disappears
-(0.07). The popularity buckets were designed for ml-100k: at 32M the 100+ bucket holds
-14% of the movies and 98% of the ratings.
+- **At this size, the laptop is faster.** DuckDB answers in 3–124 ms; Athena takes 0.5–4 s,
+  because it needs about half a second to start any query. 32M ratings (about 1 GB) still
+  fit on one computer.
+- **Athena was slower on Parquet than on CSV for the two `ratings` questions**
+  (1.8 s vs 1.6 s and 4.0 s vs 2.4 s). The likely reason is that the Parquet file is one
+  big file cut into very small blocks, which is harder for Athena to split. Not tested yet.
+- **Small questions cost the same in both formats**: Athena charges at least 10 MB per query.
+- **What the cloud adds**: one shared copy of the data for the whole group, nothing to
+  download, paying only for what is queried, and room to grow to much larger datasets
+  (for example MovieLens 1B), where one computer is no longer enough.
 
 ## Progress
 
@@ -283,12 +246,11 @@ and on IMDb), but the effect is weaker, and after removing user bias it almost d
 - [x] Glue database and crawler for the Parquet tables
 - [x] Athena tables for the raw files (DDL)
 - [x] Athena row counts match DuckDB
-- [x] Benchmark: CSV vs Parquet, DuckDB vs Athena
+- [x] Performance evidence: CSV vs Parquet, laptop vs cloud, 100k vs 32M
 - [x] Notebook configurable by dataset (`BDF_DATASET`), Parquet rebuilt when stale
 - [x] MovieLens 32M: local run and comparison of results
-- [x] MovieLens 32M in S3 / Glue / Athena (row counts match) and Athena benchmark
-- [ ] File layout for Athena: larger row groups, several files, partitioning by year
+- [x] MovieLens 32M in S3 / Glue / Athena (row counts match)
+- [ ] (Optional) Test file layout for Athena: bigger blocks, several files, partitions
 - [ ] Remove the old flat Parquet folders from S3 (`parquet/movies/`, `parquet/ratings/`,
       `parquet/links/`, `parquet/imdb_basics/`, `parquet/imdb_ratings/`)
-- [ ] Partition `ratings` (e.g. by year) and measure partition pruning
 - [ ] Slides: architecture, evidence, performance, conclusions
