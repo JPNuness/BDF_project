@@ -30,7 +30,7 @@ locally with DuckDB and Parquet, then in the cloud with Amazon S3, AWS Glue and 
 ```
 src/popularity_vs_quality.ipynb   analysis notebook (local layer)
 cloud/aws_setup.py                S3 upload + Glue crawler + Athena row-count check
-cloud/benchmark.py                same queries on CSV vs Parquet, DuckDB vs Athena
+cloud/benchmark.py                the same questions in Athena on CSV vs Parquet
 cloud/benchmark_results_*.csv     latest benchmark output, one file per dataset
 requirements.txt                  pinned dependencies
 ```
@@ -171,15 +171,19 @@ zeros (`0114709` → `114709`), which breaks the link to IMDb.
 
 ## Performance and scalability evidence
 
+All measurements are made in **Athena**, as in the course labs: under every query Athena
+shows the **run time** and the **data scanned**, which is also what it bills ($5 per TB,
+at least 10 MB per query).
+
 ```bash
 python cloud/benchmark.py                    # MovieLens 100k
 python cloud/benchmark.py --dataset ml-32m   # MovieLens 32M
 ```
 
-We asked the same questions from the notebook in four ways: on the original **CSV** files
-and on **Parquet** files, on a **laptop** (DuckDB) and in the **cloud** (Athena). All four
-always gave the same answer. Each run was repeated 3 times and the middle time is shown.
-Full numbers: `cloud/benchmark_results_ml-100k.csv` and `cloud/benchmark_results_ml-32m.csv`.
+The script asks two questions from the notebook, once on the original **CSV** files and
+once on the **Parquet** files, 3 times each (the middle time is shown). Both formats
+always gave the same answer. Full numbers: `cloud/benchmark_results_ml-100k.csv` and
+`cloud/benchmark_results_ml-32m.csv`.
 
 ### 1. Parquet files are much smaller
 
@@ -188,59 +192,47 @@ Full numbers: `cloud/benchmark_results_ml-100k.csv` and `cloud/benchmark_results
 | MovieLens 32M ratings   | 877 MB  | 219 MB              | 4×         |
 | IMDb list of titles     | 1.1 GB  | 18 MB (films only)  | 60×        |
 
-Uploading the 32M ratings to the cloud took 27 s as CSV and 6 s as Parquet.
+Uploading the 32M ratings to S3 took 27 s as CSV and 6 s as Parquet.
 
-### 2. In the cloud, Parquet reads less data, so it costs less
+### 2. Parquet scans less data, so it costs less
 
-Athena charges for the data it reads ($5 per TB). Parquet stores each column separately,
-so Athena reads only the columns a question needs; a CSV file has to be read in full.
+Parquet stores each column separately, so Athena reads only the columns a question needs;
+a CSV file has to be read in full.
 
-| Question (MovieLens 32M)               | Data read: CSV | Parquet | Cost per 1,000 runs: CSV | Parquet |
-| -------------------------------------- | -------------- | ------- | ------------------------ | ------- |
-| Average rating per popularity level    | 877 MB         | 86 MB   | $4.39                    | $0.43   |
-| Rating vs the user's usual rating      | 877 MB         | 88 MB   | $4.39                    | $0.44   |
-| IMDb rating per number of votes        | 1,158 MB       | 17 MB   | $5.79                    | $0.09   |
-| Number of IMDb genres (one column)     | 1,128 MB       | 0.9 MB  | $5.64                    | $0.05   |
+| Question (MovieLens 32M)               | Data scanned: CSV | Parquet | Cost per 1,000 runs: CSV | Parquet |
+| -------------------------------------- | ----------------- | ------- | ------------------------ | ------- |
+| Average rating per popularity level    | 877 MB            | 86 MB   | $4.39                    | $0.43   |
+| IMDb rating per number of votes        | 1,158 MB          | 17 MB   | $5.79                    | $0.09   |
 
-Counting rows read **0 MB**: a Parquet file stores its row count, so Athena does not need
+Counting rows scans **0 MB**: a Parquet file stores its row count, so Athena does not need
 to open the data at all.
 
-### 3. On the laptop, Parquet is 6 to 100 times faster
-
-| Question (MovieLens 32M)               | CSV    | Parquet |
-| -------------------------------------- | ------ | ------- |
-| Average rating per popularity level    | 395 ms | 60 ms   |
-| Rating vs the user's usual rating      | 853 ms | 124 ms  |
-| IMDb rating per number of votes        | 357 ms | 23 ms   |
-| Number of IMDb genres (one column)     | 286 ms | 3 ms    |
-
-### 4. 317 times more data, only 3 times more time in the cloud
+### 3. 317 times more data, only 2.4 times more time
 
 Going from MovieLens 100k to 32M (317× more ratings), question "average rating per
-popularity level", Parquet:
+popularity level", on Parquet:
 
-|                         | 100k    | 32M      | Growth |
-| ----------------------- | ------- | -------- | ------ |
-| Data read by Athena     | 0.27 MB | 86 MB    | 320×   |
-| Time in Athena          | 0.55 s  | 1.8 s    | 3.3×   |
-| Time on the laptop      | 4 ms    | 60 ms    | 15×    |
+|                   | 100k    | 32M     | Growth |
+| ----------------- | ------- | ------- | ------ |
+| Data scanned      | 0.27 MB | 86 MB   | 320×   |
+| Run time          | 0.57 s  | 1.36 s  | 2.4×   |
 
-Athena splits the work among many machines, so its time grows much more slowly than the
-data. The whole notebook also still runs on 32M in about 6 seconds on the laptop.
+Athena splits the work among many machines, so its run time grows much more slowly than
+the data. The cost grows with the data scanned, which is why the file format matters.
 
-### 5. Limits: where the cloud does not help (yet)
+### 4. Limits
 
-- **At this size, the laptop is faster.** DuckDB answers in 3–124 ms; Athena takes 0.5–4 s,
-  because it needs about half a second to start any query. 32M ratings (about 1 GB) still
-  fit on one computer.
-- **Athena was slower on Parquet than on CSV for the two `ratings` questions**
-  (1.8 s vs 1.6 s and 4.0 s vs 2.4 s). A possible cause is that the Parquet file is one
-  large file split into very small blocks, which is harder for Athena to divide. Testing
-  other layouts (bigger blocks, several files, partitions) is future work.
-- **Small questions cost the same in both formats**: Athena charges at least 10 MB per query.
+- **Parquet is not faster than CSV in run time** at this size (1.36 s vs 1.33 s and
+  2.0 s vs 1.6 s): its advantage is the data scanned and the cost. A possible cause is that
+  the Parquet file is one large file split into very small blocks, which is harder for
+  Athena to divide. Testing other layouts (bigger blocks, several files, partitions) is
+  future work.
+- **Every query takes at least about half a second**, however small: Athena needs that
+  time to start.
+- **Small questions cost the same in both formats**: Athena bills at least 10 MB per query.
 - **What the cloud adds**: one shared copy of the data for the whole group, nothing to
   download, paying only for what is queried, and room to grow to much larger datasets
-  (for example MovieLens 1B), where one computer is no longer enough.
+  (for example MovieLens 1B).
 
 ## Progress
 
@@ -251,7 +243,7 @@ Done:
 - [x] Notebook works with MovieLens 100k and 32M (`BDF_DATASET`)
 - [x] Cloud layer: data in S3, tables in the Glue Data Catalog, queries in Athena, for
       both datasets; row counts match the laptop
-- [x] Performance and scalability evidence: CSV vs Parquet, laptop vs cloud, 100k vs 32M
+- [x] Performance and scalability evidence in Athena: CSV vs Parquet, 100k vs 32M
 
 To do:
 
