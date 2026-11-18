@@ -1,14 +1,16 @@
 """Benchmark: the same queries on raw CSV/TSV vs Parquet, locally (DuckDB) and in Athena.
 
-Run from the project root after cloud/aws_setup.py:
+Run from the project root after cloud/aws_setup.py (same --dataset):
 
-    python cloud/benchmark.py
+    python cloud/benchmark.py                    # ml-100k (ml-latest-small)
+    python cloud/benchmark.py --dataset ml-32m
 
 Creates the raw_* Athena tables over data/ in S3 (DDL, not the crawler: the crawler would
 read links.imdbId as a number and drop its leading zeros), runs every query REPEATS times
-per engine and format, and writes cloud/benchmark_results.csv.
+per engine and format, and writes cloud/benchmark_results_<dataset>.csv.
 """
 
+import argparse
 import csv
 import statistics
 import time
@@ -16,69 +18,76 @@ from pathlib import Path
 
 import duckdb
 
-from aws_setup import DATA_BUCKET, ROOT, athena_query, check_credentials
+import aws_setup
+from aws_setup import DATA_BUCKET, DATASETS, ROOT, athena_query, check_credentials
 
 REPEATS = 3
 ATHENA_USD_PER_TB = 5.0  # on-demand price, us-east-1
 ATHENA_MIN_BYTES = 10 * 1024**2  # every query is billed at least 10 MB
 S3 = f"s3://{DATA_BUCKET}/data"
-OUT = Path(__file__).with_name("benchmark_results.csv")
+
 
 # ---------------------------------------------------------------- raw tables (Athena)
-RAW_DDL = [
-    f"""CREATE EXTERNAL TABLE IF NOT EXISTS raw_movies (movieid string, title string, genres string)
-        ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.OpenCSVSerde'
-        WITH SERDEPROPERTIES ('separatorChar' = ',', 'quoteChar' = '"')
-        LOCATION '{S3}/ml-100k/movies/' TBLPROPERTIES ('skip.header.line.count' = '1')""",
-    f"""CREATE EXTERNAL TABLE IF NOT EXISTS raw_ratings
-        (userid bigint, movieid bigint, rating double, `timestamp` bigint)
-        ROW FORMAT DELIMITED FIELDS TERMINATED BY ','
-        LOCATION '{S3}/ml-100k/ratings/' TBLPROPERTIES ('skip.header.line.count' = '1')""",
-    f"""CREATE EXTERNAL TABLE IF NOT EXISTS raw_links (movieid bigint, imdbid string, tmdbid bigint)
-        ROW FORMAT DELIMITED FIELDS TERMINATED BY ','
-        LOCATION '{S3}/ml-100k/links/' TBLPROPERTIES ('skip.header.line.count' = '1')""",
-    # IMDb TSV: no quoting, \N for NULL (LazySimpleSerDe's default null marker)
-    rf"""CREATE EXTERNAL TABLE IF NOT EXISTS raw_imdb_basics
-        (tconst string, titletype string, primarytitle string, originaltitle string,
-         isadult string, startyear string, endyear string, runtimeminutes string, genres string)
-        ROW FORMAT DELIMITED FIELDS TERMINATED BY '\t'
-        LOCATION '{S3}/imdb/title.basics/' TBLPROPERTIES ('skip.header.line.count' = '1')""",
-    rf"""CREATE EXTERNAL TABLE IF NOT EXISTS raw_imdb_ratings
-        (tconst string, averagerating double, numvotes int)
-        ROW FORMAT DELIMITED FIELDS TERMINATED BY '\t'
-        LOCATION '{S3}/imdb/title.ratings/' TBLPROPERTIES ('skip.header.line.count' = '1')""",
-]
+def raw_ddl(dataset):
+    return [
+        f"""CREATE EXTERNAL TABLE IF NOT EXISTS raw_movies (movieid string, title string, genres string)
+            ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.OpenCSVSerde'
+            WITH SERDEPROPERTIES ('separatorChar' = ',', 'quoteChar' = '"')
+            LOCATION '{S3}/{dataset}/movies/' TBLPROPERTIES ('skip.header.line.count' = '1')""",
+        f"""CREATE EXTERNAL TABLE IF NOT EXISTS raw_ratings
+            (userid bigint, movieid bigint, rating double, `timestamp` bigint)
+            ROW FORMAT DELIMITED FIELDS TERMINATED BY ','
+            LOCATION '{S3}/{dataset}/ratings/' TBLPROPERTIES ('skip.header.line.count' = '1')""",
+        f"""CREATE EXTERNAL TABLE IF NOT EXISTS raw_links (movieid bigint, imdbid string, tmdbid bigint)
+            ROW FORMAT DELIMITED FIELDS TERMINATED BY ','
+            LOCATION '{S3}/{dataset}/links/' TBLPROPERTIES ('skip.header.line.count' = '1')""",
+        # IMDb TSV: no quoting, \N for NULL (LazySimpleSerDe's default null marker)
+        rf"""CREATE EXTERNAL TABLE IF NOT EXISTS raw_imdb_basics
+            (tconst string, titletype string, primarytitle string, originaltitle string,
+             isadult string, startyear string, endyear string, runtimeminutes string, genres string)
+            ROW FORMAT DELIMITED FIELDS TERMINATED BY '\t'
+            LOCATION '{S3}/imdb/title.basics/' TBLPROPERTIES ('skip.header.line.count' = '1')""",
+        rf"""CREATE EXTERNAL TABLE IF NOT EXISTS raw_imdb_ratings
+            (tconst string, averagerating double, numvotes int)
+            ROW FORMAT DELIMITED FIELDS TERMINATED BY '\t'
+            LOCATION '{S3}/imdb/title.ratings/' TBLPROPERTIES ('skip.header.line.count' = '1')""",
+    ]
+
 
 # ---------------------------------------------------------------- table sources per engine/format
-ML, IMDB, PQ = ROOT / "data/ml-100k", ROOT / "data/imdb", ROOT / "src/parquet"
 TSV = "delim='\t', quote='', header=true, nullstr='\\N', all_varchar=true"
-SOURCES = {
-    ("duckdb", "raw"): {
-        "ratings": f"read_csv('{ML / 'ratings.csv'}')",
-        "imdb_basics": f"read_csv('{IMDB / 'title.basics.tsv'}', {TSV})",
-        "imdb_ratings": f"(SELECT tconst, CAST(averageRating AS DOUBLE) AS averagerating, "
-        f"CAST(numVotes AS INTEGER) AS numvotes FROM read_csv('{IMDB / 'title.ratings.tsv'}', {TSV}))",
-        "movie_filter": "AND b.titletype = 'movie'",  # raw IMDb has every title type
-    },
-    ("duckdb", "parquet"): {
-        "ratings": f"read_parquet('{PQ / 'ratings.parquet'}')",
-        "imdb_basics": f"read_parquet('{PQ / 'imdb_basics.parquet'}')",
-        "imdb_ratings": f"read_parquet('{PQ / 'imdb_ratings.parquet'}')",
-        "movie_filter": "",  # already reduced to feature films when converted
-    },
-    ("athena", "raw"): {
-        "ratings": "raw_ratings",
-        "imdb_basics": "raw_imdb_basics",
-        "imdb_ratings": "raw_imdb_ratings",
-        "movie_filter": "AND b.titletype = 'movie'",
-    },
-    ("athena", "parquet"): {
-        "ratings": "ratings",
-        "imdb_basics": "imdb_basics",
-        "imdb_ratings": "imdb_ratings",
-        "movie_filter": "",
-    },
-}
+
+
+def sources(dataset):
+    ml, imdb, pq = ROOT / "data" / dataset, ROOT / "data/imdb", ROOT / "src/parquet"
+    return {
+        ("duckdb", "raw"): {
+            "ratings": f"read_csv('{ml / 'ratings.csv'}')",
+            "imdb_basics": f"read_csv('{imdb / 'title.basics.tsv'}', {TSV})",
+            "imdb_ratings": f"(SELECT tconst, CAST(averageRating AS DOUBLE) AS averagerating, "
+            f"CAST(numVotes AS INTEGER) AS numvotes FROM read_csv('{imdb / 'title.ratings.tsv'}', {TSV}))",
+            "movie_filter": "AND b.titletype = 'movie'",  # raw IMDb has every title type
+        },
+        ("duckdb", "parquet"): {
+            "ratings": f"read_parquet('{pq / dataset / 'ratings.parquet'}')",
+            "imdb_basics": f"read_parquet('{pq / 'imdb/imdb_basics.parquet'}')",
+            "imdb_ratings": f"read_parquet('{pq / 'imdb/imdb_ratings.parquet'}')",
+            "movie_filter": "",  # already reduced to feature films when converted
+        },
+        ("athena", "raw"): {
+            "ratings": "raw_ratings",
+            "imdb_basics": "raw_imdb_basics",
+            "imdb_ratings": "raw_imdb_ratings",
+            "movie_filter": "AND b.titletype = 'movie'",
+        },
+        ("athena", "parquet"): {
+            "ratings": "ratings",
+            "imdb_basics": "imdb_basics",
+            "imdb_ratings": "imdb_ratings",
+            "movie_filter": "",
+        },
+    }
+
 
 # ---------------------------------------------------------------- queries (from the notebook)
 QUERIES = {
@@ -90,6 +99,16 @@ QUERIES = {
                     ELSE '100+' END AS bucket,
                COUNT(*) AS movies, ROUND(AVG(a), 2) AS mean_rating
         FROM s GROUP BY 1 ORDER BY MIN(n)""",
+    # Section 3a: rating vs each rater's own average, per popularity bucket (join on ratings)
+    "ml_user_bias": """
+        WITH u AS (SELECT userid, AVG(rating) AS ua FROM {ratings} GROUP BY userid),
+             m AS (SELECT r.movieid, COUNT(*) AS n, AVG(r.rating - u.ua) AS d
+                   FROM {ratings} r JOIN u ON u.userid = r.userid GROUP BY r.movieid)
+        SELECT CASE WHEN n = 1 THEN '1' WHEN n < 5 THEN '2-4' WHEN n < 10 THEN '5-9'
+                    WHEN n < 20 THEN '10-19' WHEN n < 50 THEN '20-49' WHEN n < 100 THEN '50-99'
+                    ELSE '100+' END AS bucket,
+               COUNT(*) AS movies, ROUND(AVG(d), 2) AS mean_vs_user_avg
+        FROM m GROUP BY 1 ORDER BY MIN(n)""",
     # Section 3c: all IMDb feature films, rating per votes level (IMDb, large join)
     "imdb_rating_by_votes": """
         SELECT CASE WHEN r.numvotes < 1000 THEN '100-999' WHEN r.numvotes < 10000 THEN '1k-9.9k'
@@ -135,9 +154,15 @@ def normalise(rows):
 
 
 def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--dataset", choices=DATASETS, default="ml-100k")
+    dataset = ap.parse_args().dataset
+    aws_setup.set_dataset(dataset)
+    out = Path(__file__).with_name(f"benchmark_results_{dataset}.csv")
+
     check_credentials()
     print("\n=== Raw tables in Athena")
-    for ddl in RAW_DDL:
+    for ddl in raw_ddl(dataset):
         athena_query(ddl)
         print("  ", ddl.split("EXISTS")[1].split("(")[0].strip())
 
@@ -145,7 +170,7 @@ def main():
     for qname, template in QUERIES.items():
         print(f"\n=== {qname}")
         reference = None
-        for (engine, fmt), src in SOURCES.items():
+        for (engine, fmt), src in sources(dataset).items():
             sql = template.format(**src)
             runner = run_duckdb if engine == "duckdb" else run_athena
             times, scanned, rows = [], None, None
@@ -160,7 +185,7 @@ def main():
                 max(scanned, ATHENA_MIN_BYTES) / 1e12 * ATHENA_USD_PER_TB if scanned is not None else None
             )
             results.append(
-                dict(query=qname, engine=engine, format=fmt, median_ms=round(ms),
+                dict(dataset=dataset, query=qname, engine=engine, format=fmt, median_ms=round(ms),
                      bytes_scanned=scanned, usd_per_query=cost, same_result=same)
             )
             scanned_txt = f"{scanned / 1e6:10,.2f} MB" if scanned is not None else f"{'-':>13}"
@@ -168,11 +193,11 @@ def main():
             print(f"  {engine:<7}{fmt:<8}{ms:>9,.0f} ms {scanned_txt}  {cost_txt:<10} "
                   f"{'same result' if same else 'DIFFERENT RESULT'}")
 
-    with OUT.open("w", newline="") as f:
+    with out.open("w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=results[0].keys())
         w.writeheader()
         w.writerows(results)
-    print(f"\nSaved {OUT.relative_to(ROOT)}")
+    print(f"\nSaved {out.relative_to(ROOT)}")
 
 
 if __name__ == "__main__":

@@ -1,12 +1,13 @@
 """Cloud layer: S3 + Glue Data Catalog + Athena.
 
 Uploads the local files to S3, catalogs the Parquet tables with a Glue crawler and
-checks in Athena that the row counts match the local DuckDB tables.
+checks in Athena that the row counts match the local Parquet files.
 
-Run from the project root, after the notebook has generated src/parquet/:
+Run from the project root, after the notebook has generated src/parquet/ for the dataset:
 
-    python cloud/aws_setup.py            # every step
-    python cloud/aws_setup.py --skip-upload
+    python cloud/aws_setup.py                      # ml-100k (ml-latest-small)
+    python cloud/aws_setup.py --dataset ml-32m
+    python cloud/aws_setup.py --skip-upload        # files already in S3
 
 Credentials: AWS Academy Learner Lab -> AWS Details -> AWS CLI -> copy the block into
 ~/.aws/credentials. They expire when the lab session ends.
@@ -28,23 +29,46 @@ from botocore.exceptions import ClientError
 REGION = "us-east-1"
 DATA_BUCKET = "bdf-movies-data-g23"
 RESULTS_BUCKET = "bdf-athena-results-g23"
-DATABASE = "bdf_project"
-CRAWLER = "bdf-parquet-crawler"
 ROLE = "LabRole"  # the only role AWS Academy Learner Lab allows
+DATASETS = ["ml-100k", "ml-32m"]
 
 ROOT = Path(__file__).resolve().parent.parent
 STAGING = ROOT / "s3_upload"  # local mirror of the bucket layout
+ML_TABLES = ["movies", "ratings", "links"]
+IMDB_TABLES = ["imdb_basics", "imdb_ratings"]
+TABLES = ML_TABLES + IMDB_TABLES
 
-# S3 layout: one folder per table (Athena reads every file under a table's LOCATION).
-RAW_FILES = {  # local file -> S3 key, names as in the README's data/ layout
-    "data/ml-100k/movies.csv": "data/ml-100k/movies/movies.csv",
-    "data/ml-100k/ratings.csv": "data/ml-100k/ratings/ratings.csv",
-    "data/ml-100k/links.csv": "data/ml-100k/links/links.csv",
-    "data/imdb/title.basics.tsv": "data/imdb/title.basics/title.basics.tsv",
-    "data/imdb/title.ratings.tsv": "data/imdb/title.ratings/title.ratings.tsv",
-}
-TABLES = ["movies", "ratings", "links", "imdb_basics", "imdb_ratings"]
-PARQUET_FILES = {f"src/parquet/{t}.parquet": f"parquet/{t}/{t}.parquet" for t in TABLES}
+# Set by set_dataset(); ml-100k keeps the original names (database bdf_project).
+DATASET = DATABASE = CRAWLER = None
+
+
+def set_dataset(dataset):
+    global DATASET, DATABASE, CRAWLER
+    suffix = "" if dataset == "ml-100k" else "_" + dataset.removeprefix("ml-")
+    DATASET = dataset
+    DATABASE = f"bdf_project{suffix}"  # bdf_project, bdf_project_32m
+    CRAWLER = f"bdf-parquet-crawler{suffix.replace('_', '-')}"  # bdf-parquet-crawler(-32m)
+
+
+set_dataset("ml-100k")
+
+
+def parquet_dir(table):
+    """S3 folder (and src/parquet subfolder) of a table: IMDb is shared by every dataset."""
+    return "imdb" if table in IMDB_TABLES else DATASET
+
+
+def files():
+    """local file -> S3 key. One folder per table: Athena reads every file under a
+    table's LOCATION. File names stay as in data/ and src/parquet/."""
+    raw = {f"data/{DATASET}/{t}.csv": f"data/{DATASET}/{t}/{t}.csv" for t in ML_TABLES}
+    raw |= {f"data/imdb/{n}.tsv": f"data/imdb/{n}/{n}.tsv" for n in ("title.basics", "title.ratings")}
+    pq = {
+        f"src/parquet/{parquet_dir(t)}/{t}.parquet": f"parquet/{parquet_dir(t)}/{t}/{t}.parquet"
+        for t in TABLES
+    }
+    return raw | pq
+
 
 session = boto3.Session(region_name=REGION)
 s3 = session.client("s3")
@@ -58,7 +82,7 @@ def step(title):
 
 # ---------------------------------------------------------------- 0. credentials
 def check_credentials():
-    step("Credentials")
+    step(f"Credentials ({DATASET} -> database {DATABASE})")
     try:
         ident = session.client("sts").get_caller_identity()
     except Exception as e:  # noqa: BLE001 - any failure here means no usable credentials
@@ -84,7 +108,7 @@ def ensure_bucket(name):
 
 def build_staging():
     """Mirror the bucket layout locally in s3_upload/ (APFS clones, no extra disk)."""
-    for local, key in {**RAW_FILES, **PARQUET_FILES}.items():
+    for local, key in files().items():
         src, dst = ROOT / local, STAGING / key
         if not src.exists():
             raise SystemExit(f"missing {src} - download the data / run the notebook first")
@@ -98,8 +122,8 @@ def upload():
     ensure_bucket(DATA_BUCKET)
     ensure_bucket(RESULTS_BUCKET)
     build_staging()
-    for path in sorted(p for p in STAGING.rglob("*") if p.is_file() and p.name != ".DS_Store"):
-        key = path.relative_to(STAGING).as_posix()
+    for key in sorted(files().values()):
+        path = STAGING / key
         size = path.stat().st_size
         try:
             if s3.head_object(Bucket=DATA_BUCKET, Key=key)["ContentLength"] == size:
@@ -121,10 +145,20 @@ def run_crawler():
     except glue.exceptions.AlreadyExistsException:
         print(f"database {DATABASE}: exists")
 
+    # Drop the crawler's tables first, so a table whose S3 folder moved is recreated
+    # under the same name instead of the crawler adding a second, suffixed one.
+    for t in TABLES:
+        try:
+            glue.delete_table(DatabaseName=DATABASE, Name=t)
+        except glue.exceptions.EntityNotFoundException:
+            pass
+
     config = dict(
         Role=ROLE,
         DatabaseName=DATABASE,
-        Targets={"S3Targets": [{"Path": f"s3://{DATA_BUCKET}/parquet/{t}/"} for t in TABLES]},
+        Targets={
+            "S3Targets": [{"Path": f"s3://{DATA_BUCKET}/parquet/{parquet_dir(t)}/{t}/"} for t in TABLES]
+        },
     )
     try:
         glue.create_crawler(Name=CRAWLER, **config)
@@ -146,12 +180,12 @@ def run_crawler():
 
     for t in glue.get_tables(DatabaseName=DATABASE)["TableList"]:
         cols = ", ".join(f"{c['Name']} {c['Type']}" for c in t["StorageDescriptor"]["Columns"])
-        print(f"  {t['Name']:<14} {cols}")
+        print(f"  {t['Name']:<16} {cols}")
 
 
 # ---------------------------------------------------------------- 3. Athena
 def athena_query(sql):
-    """Run one statement, wait, return (rows, stats)."""
+    """Run one statement in DATABASE, wait, return (rows, stats)."""
     qid = athena.start_query_execution(
         QueryString=sql,
         QueryExecutionContext={"Database": DATABASE},
@@ -171,16 +205,17 @@ def athena_query(sql):
 
 
 def compare_counts():
-    step("Athena vs local DuckDB: row counts")
+    step("Athena vs local Parquet: row counts")
     sql = " UNION ALL ".join(f"SELECT '{t}', COUNT(*) FROM {t}" for t in TABLES)
     rows, stats = athena_query(sql)
     cloud = {name: int(n) for name, n in rows}
-    print(f"{'table':<14}{'athena':>12}{'duckdb':>12}")
+    print(f"{'table':<14}{'athena':>14}{'duckdb':>14}")
     ok = True
     for t in TABLES:
-        local = duckdb.sql(f"SELECT COUNT(*) FROM '{ROOT / 'src/parquet' / t}.parquet'").fetchall()[0][0]
+        local_file = ROOT / f"src/parquet/{parquet_dir(t)}/{t}.parquet"
+        local = duckdb.sql(f"SELECT COUNT(*) FROM '{local_file}'").fetchall()[0][0]
         ok &= cloud.get(t) == local
-        print(f"{t:<14}{cloud.get(t, 0):>12,}{local:>12,}  {'OK' if cloud.get(t) == local else 'DIFF'}")
+        print(f"{t:<14}{cloud.get(t, 0):>14,}{local:>14,}  {'OK' if cloud.get(t) == local else 'DIFF'}")
     print(
         f"{'all match' if ok else 'MISMATCH'} - "
         f"{stats['EngineExecutionTimeInMillis']} ms, {stats['DataScannedInBytes']:,} bytes scanned"
@@ -189,10 +224,12 @@ def compare_counts():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--dataset", choices=DATASETS, default="ml-100k")
     ap.add_argument("--skip-upload", action="store_true", help="files are already in S3")
     ap.add_argument("--skip-crawler", action="store_true", help="tables are already in the catalog")
     args = ap.parse_args()
 
+    set_dataset(args.dataset)
     check_credentials()
     if not args.skip_upload:
         upload()
