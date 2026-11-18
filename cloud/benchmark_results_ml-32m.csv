@@ -1,0 +1,17 @@
+dataset,query,engine,format,median_ms,bytes_scanned,usd_per_query,same_result
+ml-32m,ml_rating_by_popularity,duckdb,raw,395,,,True
+ml-32m,ml_rating_by_popularity,duckdb,parquet,60,,,True
+ml-32m,ml_rating_by_popularity,athena,raw,1572,877101951,0.004385509755,True
+ml-32m,ml_rating_by_popularity,athena,parquet,1830,86431653,0.000432158265,True
+ml-32m,ml_user_bias,duckdb,raw,853,,,True
+ml-32m,ml_user_bias,duckdb,parquet,124,,,True
+ml-32m,ml_user_bias,athena,raw,2418,877101951,0.004385509755,True
+ml-32m,ml_user_bias,athena,parquet,4020,87967446,0.00043983723,True
+ml-32m,imdb_rating_by_votes,duckdb,raw,357,,,True
+ml-32m,imdb_rating_by_votes,duckdb,parquet,23,,,True
+ml-32m,imdb_rating_by_votes,athena,raw,1885,1157872082,0.00578936041,True
+ml-32m,imdb_rating_by_votes,athena,parquet,2122,17170657,8.5853285e-05,True
+ml-32m,imdb_one_column,duckdb,raw,286,,,True
+ml-32m,imdb_one_column,duckdb,parquet,3,,,True
+ml-32m,imdb_one_column,athena,raw,1377,1127581372,0.00563790686,True
+ml-32m,imdb_one_column,athena,parquet,631,936762,5.2428799999999995e-05,True
