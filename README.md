@@ -234,8 +234,9 @@ data. The whole notebook also still runs on 32M in about 6 seconds on the laptop
   because it needs about half a second to start any query. 32M ratings (about 1 GB) still
   fit on one computer.
 - **Athena was slower on Parquet than on CSV for the two `ratings` questions**
-  (1.8 s vs 1.6 s and 4.0 s vs 2.4 s). The likely reason is that the Parquet file is one
-  big file cut into very small blocks, which is harder for Athena to split. Not tested yet.
+  (1.8 s vs 1.6 s and 4.0 s vs 2.4 s). A possible cause is that the Parquet file is one
+  large file split into very small blocks, which is harder for Athena to divide. Testing
+  other layouts (bigger blocks, several files, partitions) is future work.
 - **Small questions cost the same in both formats**: Athena charges at least 10 MB per query.
 - **What the cloud adds**: one shared copy of the data for the whole group, nothing to
   download, paying only for what is queried, and room to grow to much larger datasets
@@ -255,6 +256,5 @@ Done:
 To do:
 
 - [ ] Slides: questions, architecture, evidence, performance/scalability, conclusions
-- [ ] Delete the old Parquet folders in S3, no longer used: `parquet/movies/`,
-      `parquet/ratings/`, `parquet/links/`, `parquet/imdb_basics/`, `parquet/imdb_ratings/`
-- [ ] (Optional) Test other file layouts in Athena: bigger blocks, several files, partitions
+- [ ] Future work (optional): test other file layouts in Athena (bigger blocks, several
+      files, partitions)
