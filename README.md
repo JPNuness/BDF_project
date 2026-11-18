@@ -175,15 +175,91 @@ All measurements are made in **Athena**, as in the course labs: under every quer
 shows the **run time** and the **data scanned**, which is also what it bills ($5 per TB,
 at least 10 MB per query).
 
+### What the benchmark does
+
+`cloud/benchmark.py` repeats in Athena what you would otherwise do by hand in the Athena
+console: run a query, then write down the run time and the data scanned shown under it.
+
+It asks **two questions from the notebook**:
+
+| Question                                         | Table it reads                                  |
+| ------------------------------------------------ | ----------------------------------------------- |
+| Average rating per popularity level (MovieLens)  | the ratings (100k or 32M)                       |
+| IMDb rating per number of votes (IMDb)           | the IMDb titles (1.1 GB) and the IMDb ratings   |
+
+Each question is asked on **the same data in two formats**:
+
+- **CSV**: the original files in `s3://bdf-movies-data-g23/data/`
+  (Athena tables `raw_ratings`, `raw_imdb_basics`, `raw_imdb_ratings`);
+- **Parquet**: the converted files in `s3://bdf-movies-data-g23/parquet/`
+  (Athena tables `ratings`, `imdb_basics`, `imdb_ratings`).
+
+Step by step, the script:
+
+1. checks the AWS credentials;
+2. tells Athena where the CSV files are (the Parquet tables were already made by the
+   Glue crawler);
+3. runs each question **3 times on CSV and 3 times on Parquet**, and keeps the middle run
+   time, so that one slow run does not change the result;
+4. reads, for each question, the **run time** and the **data scanned** that Athena reports,
+   and works out the **cost** ($5 per TB scanned, at least 10 MB per query);
+5. checks that CSV and Parquet give **exactly the same answer**;
+6. saves everything in `cloud/benchmark_results_<dataset>.csv`.
+
+How to run it (from the project folder, with the AWS credentials saved; about 1 minute
+per dataset, cost under $0.05):
+
 ```bash
+source .venv/bin/activate
 python cloud/benchmark.py                    # MovieLens 100k
 python cloud/benchmark.py --dataset ml-32m   # MovieLens 32M
 ```
 
-The script asks two questions from the notebook, once on the original **CSV** files and
-once on the **Parquet** files, 3 times each (the middle time is shown). Both formats
-always gave the same answer. Full numbers: `cloud/benchmark_results_ml-100k.csv` and
-`cloud/benchmark_results_ml-32m.csv`.
+The same numbers can be checked by hand: run the query in the Athena console on the
+`raw_*` table and on the Parquet table, and compare the run time and data scanned shown
+under each result.
+
+### The result files
+
+`cloud/benchmark_results_ml-100k.csv` and `cloud/benchmark_results_ml-32m.csv` (open in
+Excel) have one row per question and format, 4 rows each:
+
+| Column        | Meaning                                                              |
+| ------------- | -------------------------------------------------------------------- |
+| `dataset`     | `ml-100k` or `ml-32m`                                                |
+| `question`    | which of the two questions                                           |
+| `format`      | `CSV` or `Parquet`                                                   |
+| `time_ms`     | run time in Athena, in milliseconds (middle of 3 runs)               |
+| `mb_scanned`  | data Athena read, in MB: what it bills                               |
+| `cost_usd`    | cost of one run, in dollars                                          |
+| `same_answer` | `True` when CSV and Parquet gave the same answer                     |
+
+The latest results (all answers identical in both formats):
+
+| Dataset | Question                            | Format  | Run time | Data scanned | Cost per run |
+| ------- | ----------------------------------- | ------- | -------- | ------------ | ------------ |
+| 100k    | Average rating per popularity level | CSV     | 0.62 s   | 2.48 MB      | $0.00005     |
+| 100k    | Average rating per popularity level | Parquet | 0.57 s   | 0.27 MB      | $0.00005     |
+| 100k    | IMDb rating per number of votes     | CSV     | 1.85 s   | 1,158 MB     | $0.00579     |
+| 100k    | IMDb rating per number of votes     | Parquet | 1.95 s   | 17 MB        | $0.00009     |
+| 32M     | Average rating per popularity level | CSV     | 1.33 s   | 877 MB       | $0.00439     |
+| 32M     | Average rating per popularity level | Parquet | 1.36 s   | 86 MB        | $0.00043     |
+| 32M     | IMDb rating per number of votes     | CSV     | 1.60 s   | 1,158 MB     | $0.00579     |
+| 32M     | IMDb rating per number of votes     | Parquet | 2.02 s   | 17 MB        | $0.00009     |
+
+How to read them:
+
+- **Data scanned is the big difference.** Parquet reads 10× less for the MovieLens 32M
+  question (86 MB instead of 877 MB) and 67× less for the IMDb question (17 MB instead of
+  1,158 MB), so it costs 10× and 67× less.
+- **Run time is about the same** in both formats (differences of a few tenths of a
+  second). At these sizes the time is mostly Athena starting the query.
+- **The IMDb question is the same in both files** because the IMDb data does not change
+  with the MovieLens dataset.
+- **The 100k MovieLens question costs the same in both formats**: both read less than
+  10 MB, the minimum Athena bills.
+
+The sections below summarise what these results show.
 
 ### 1. Parquet files are much smaller
 
