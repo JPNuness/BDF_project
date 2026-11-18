@@ -324,5 +324,7 @@ Done:
 To do:
 
 - [ ] Slides: questions, architecture, evidence, performance/scalability, conclusions
+- [ ] Delete the old Parquet folders in S3, no longer used: `parquet/movies/`,
+      `parquet/ratings/`, `parquet/links/`, `parquet/imdb_basics/`, `parquet/imdb_ratings/`
 - [ ] Future work (optional): test other file layouts in Athena (bigger blocks, several
       files, partitions)
