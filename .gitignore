@@ -10,3 +10,7 @@ data/
 src/parquet/
 *.duckdb
 *.duckdb.wal
+
+# Local staging for S3 upload
+s3_upload/
+.DS_Store
