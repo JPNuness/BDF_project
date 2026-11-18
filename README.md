@@ -32,6 +32,7 @@ src/popularity_vs_quality.ipynb   analysis notebook (local layer)
 cloud/aws_setup.py                S3 upload + Glue crawler + Athena row-count check
 cloud/benchmark.py                the same questions in Athena on CSV vs Parquet
 cloud/benchmark_results_*.csv     latest benchmark output, one file per dataset
+cloud/partitioning.sql            ratings partitioned by year in Athena (CTAS) + before/after queries
 requirements.txt                  pinned dependencies
 ```
 
@@ -296,13 +297,69 @@ popularity level", on Parquet:
 Athena splits the work among many machines, so its run time grows much more slowly than
 the data. The cost grows with the data scanned, which is why the file format matters.
 
-### 4. Limits
+### 4. Partitioning by year
+
+The ratings are an event log: every rating has a time, and questions are often about a
+period ("ratings in 2015", "the latest years"). Following the course (W6, W7), the
+MovieLens 32M ratings were rewritten as a table **partitioned by year**: one S3 folder per
+year, so Athena can skip the folders a question does not need.
+
+**Why year, and not another column** (number of distinct values in MovieLens 32M):
+
+| Column   | Distinct values | Partition by it? |
+| -------- | --------------- | ---------------- |
+| year     | 29              | **Yes**: filtered often, few values, large folders |
+| rating   | 10              | No: questions filter by time, not by rating |
+| movieId  | 84,432          | No: 84k folders of tiny files |
+| userId   | 200,948         | No: far too many values |
+
+This follows the guidelines of Costa, Costa and Santos (2019), *Evaluating partitioning
+and bucketing strategies for Hive-based Big Data Warehousing systems*, Journal of Big
+Data 6:34: partition by the attributes used in filters, prefer time attributes, check
+the number of distinct values first, and avoid many small files.
+
+**How it was built**: one Athena **CTAS** statement (`CREATE TABLE ... AS SELECT`) in the
+Athena console, database `bdf_project_32m`. It reads the Parquet ratings, adds a `year`
+column and writes `parquet/ml-32m/ratings_by_year/year=1995/ ... year=2023/` to S3, and
+registers the table and its 29 partitions in the Glue Data Catalog (no crawler needed).
+CTAS was chosen over a Glue job because it is one SQL statement, starts in seconds and
+only bills the data it reads; 29 partitions are within Athena's limit of 100. All
+statements are in `cloud/partitioning.sql`.
+
+**Results** (Athena console, one run each; queries 3a–3c all return 1,743,866 ratings,
+average 3.559):
+
+| Query                                                        | Data scanned | Run time |
+| ------------------------------------------------------------ | ------------ | -------- |
+| Build the partitioned table (CTAS, once)                     | 204 MB       | 10.9 s   |
+| One year (2015), table without partitions                    | 135 MB       | 1.44 s   |
+| **One year (2015), partitioned table, `WHERE year = 2015`**  | **0.85 MB**  | **0.87 s** |
+| One year (2015), partitioned table, filter on the timestamp  | 123 MB       | 1.34 s   |
+| All years (notebook question), table without partitions     | 82 MB        | 1.70 s   |
+| All years (notebook question), partitioned table             | 69 MB        | 1.44 s   |
+
+What this shows:
+
+- **A question about one year reads 160× less data** (135 MB → 0.85 MB) and takes 40% less
+  time: Athena opens only the `year=2015/` folder.
+- **The filter has to be written on the partition column.** `WHERE year = 2015` skips the
+  other folders; `WHERE year(from_unixtime(timestamp)) = 2015` means the same but reads
+  every folder (123 MB), because Athena decides which folders to skip from their names
+  before reading any data.
+- **Questions over all years gain nothing from the partitions**: no folder can be skipped.
+  The notebook's main question still read 16% less (82 → 69 MB), because the files Athena
+  wrote compress better, not because of the partitions.
+- **The table pays for itself quickly**: building it read 204 MB once; every one-year
+  question saves about 134 MB, so it is paid back after 2 such questions.
+
+### 5. Limits
 
 - **Parquet is not faster than CSV in run time** at this size (1.36 s vs 1.33 s and
   2.0 s vs 1.6 s): its advantage is the data scanned and the cost. A possible cause is that
   the Parquet file is one large file split into very small blocks, which is harder for
-  Athena to divide. Testing other layouts (bigger blocks, several files, partitions) is
-  future work.
+  Athena to divide.
+- **Partitions only help questions that filter by year.** The notebook's questions cover
+  all years, so for them the partitioned table reads about the same data.
 - **Every query takes at least about half a second**, however small: Athena needs that
   time to start.
 - **Small questions cost the same in both formats**: Athena bills at least 10 MB per query.
@@ -320,11 +377,12 @@ Done:
 - [x] Cloud layer: data in S3, tables in the Glue Data Catalog, queries in Athena, for
       both datasets; row counts match the laptop
 - [x] Performance and scalability evidence in Athena: CSV vs Parquet, 100k vs 32M
+- [x] Ratings partitioned by year (Athena CTAS), measured before and after
 
 To do:
 
 - [ ] Slides: questions, architecture, evidence, performance/scalability, conclusions
 - [ ] Delete the old Parquet folders in S3, no longer used: `parquet/movies/`,
       `parquet/ratings/`, `parquet/links/`, `parquet/imdb_basics/`, `parquet/imdb_ratings/`
-- [ ] Future work (optional): test other file layouts in Athena (bigger blocks, several
-      files, partitions)
+- [ ] Future work (optional): sort the ratings by movieId inside each year (the course's
+      "partitioned + sorted" layout), so questions about one movie can skip data too
