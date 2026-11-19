@@ -1,0 +1,5 @@
+dataset,question,format,time_ms,mb_scanned,cost_usd,same_answer
+ml-32m,Average rating per popularity level (MovieLens),CSV,1330,877.1,0.004385509755,True
+ml-32m,Average rating per popularity level (MovieLens),Parquet,1364,86.43,0.00043215826499999995,True
+ml-32m,IMDb rating per number of votes (IMDb),CSV,1600,1157.87,0.00578936041,True
+ml-32m,IMDb rating per number of votes (IMDb),Parquet,2020,17.17,8.585328499999999e-05,True
