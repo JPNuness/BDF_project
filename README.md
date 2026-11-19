@@ -14,8 +14,6 @@ cloud/partitioning.sql            ratings partitioned by year in Athena (CTAS) +
 requirements.txt                  pinned dependencies
 ```
 
-Not in git (downloaded or generated): `data/`, `src/parquet/`, `*.duckdb`, `s3_upload/`, `.venv/`.
-
 ## Setup
 
 1. **Python 3.11 or newer** is required (`duckdb==2.0.0` does not install on older versions;
