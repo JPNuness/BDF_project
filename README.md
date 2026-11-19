@@ -3,28 +3,6 @@
 Do movies with more ratings have higher ratings? Analysis of MovieLens + IMDb data, first
 locally with DuckDB and Parquet, then in the cloud with Amazon S3, AWS Glue and Amazon Athena.
 
-## Architecture
-
-```
-              LOCAL (laptop)                                CLOUD (AWS, us-east-1)
- ┌────────────────────────────────────────┐        ┌──────────────────────────────────────────────┐
- │ data/<dataset>/, data/imdb/  CSV / TSV │ upload │ s3://bdf-movies-data-g23/data/     CSV / TSV │
- │   │  DuckDB COPY (notebook)            │ ─────▶ │ s3://bdf-movies-data-g23/parquet/  Parquet   │
- │   ▼                                    │        │        │                                     │
- │ src/parquet/<dataset>/, imdb/  Parquet │        │        ▼                                     │
- │   │                                    │        │ Glue Data Catalog                            │
- │   ▼                                    │        │   bdf_project (100k), bdf_project_32m (32M)  │
- │ src/popularity_vs_quality_<dataset>    │        │   Parquet tables: Glue crawler               │
- │     .duckdb                            │        │   raw_* (CSV) tables: SQL                    │
- │   │                                    │        │        │                                     │
- │   ▼                                    │        │        ▼                                     │
- │ notebook: SQL + Polars + Plotly        │        │ Athena (SQL), results in                     │
- └────────────────────────────────────────┘        │ s3://bdf-athena-results-g23/                 │
-                                                   └──────────────────────────────────────────────┘
-
-<dataset> = ml-100k (default) or ml-32m
-```
-
 ## Project structure
 
 ```
@@ -156,19 +134,6 @@ The script can be run again safely: it reuses whatever already exists. It:
 3. creates the Glue database and crawler (role `LabRole`) over the Parquet folders and runs
    it: database `bdf_project` for ml-100k and `bdf_project_32m` for ml-32m;
 4. counts the rows of every table in Athena and compares them with the local Parquet files.
-
-**Result: the cloud has exactly the same data as the laptop.**
-
-| Table          | ml-100k   | ml-32m     |
-| -------------- | --------- | ---------- |
-| movies         | 9,742     | 87,585     |
-| ratings        | 100,836   | 32,000,204 |
-| links          | 9,742     | 87,585     |
-| imdb_basics    | 761,268   | 761,268    |
-| imdb_ratings   | 1,733,543 | 1,733,543  |
-
-The count scanned **0 bytes**: a Parquet file stores its row count, so Athena answers
-without opening the data.
 
 **One design choice:** the tables over the CSV files (`raw_ratings`, `raw_imdb_basics`,
 `raw_imdb_ratings`) are created with SQL instead of the crawler. The crawler would read the
